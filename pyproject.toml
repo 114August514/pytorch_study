@@ -1,7 +1,20 @@
 [project]
 name = "pytorch-study"
 version = "0.1.0"
-description = "Add your description here"
+description = "PyTorch learning project"
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+# 1. 限制 Python 版本，避免 uv 尝试解析 3.14 环境
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "pandas",
+    "matplotlib",
+    "d2l",
+    "numpy>=1.26.0", # 强制要求支持 Python 3.12 的 Numpy 版本
+]
+
+[tool.uv]
+# 2. 告诉 uv 只为 Linux 生成锁定文件
+environments = ["sys_platform == 'linux'"]
