@@ -66,8 +66,11 @@ __all__ = [
     'DATA_ROOT',
     'IS_WINDOWS',
     'Accumulator',
+    'get_default_device',
     'load_fashion_mnist',
     'count_correct',
+    'evaluate_accuracy',
+    'evaluate_accuracy_gpu',
     'cross_entropy',
     'sgd',
     'train_softmax',
@@ -109,6 +112,19 @@ class Accumulator:
 def get_dataloader_workers() -> int:
     """根据系统常量返回推荐的进程数。"""
     return 0 if IS_WINDOWS else 4
+
+def get_default_device() -> torch.device:
+    """获取当前环境的最佳计算设备 (暂未考虑多个 GPU 情况，即仅简单考虑了硬件类型)。"""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+        # cuda 与 cuda:0 是等价的
+        # 对于第二张显卡，用的是 torch.device("cuda:1")
+    
+    # 如果是 Mac M1/M2/M3，可以使用 mps
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    
+    return torch.device("cpu")
 
 # ==============================================================================
 # SECTION 2: 数据流水线 (Data Pipeline)
@@ -296,6 +312,42 @@ def evaluate_accuracy(net: Callable[[Tensor], Tensor], data_iter: DataLoader) ->
 
     with torch.no_grad(): # 评估时不需要计算梯度，节省显存和计算资源
         for X, y in data_iter:
+            metric.add(count_correct(net(X), y), y.numel())
+
+    return metric[0] / metric[1]
+
+# 评估函数 (可以接受 GPU)
+def evaluate_accuracy_gpu(net: Callable[[Tensor], Tensor], data_iter: data.DataLoader, device: torch.device = None) -> float:
+    """使用 GPU 计算在指定数据集上模型的准确率。
+    
+    Args:
+        net: 神经网络模型。
+        data_iter: 验证集或测试集的迭代器。
+        device: 指定运行的设备。如果为 None，则尝试从模型参数中推断。
+
+    Returns:
+        float: 计算得到的模型准确率。
+    """
+    if isinstance(net, nn.Module):
+        net.eval() # 设置为评估模式
+        # 如果未指定 device，则取模型第一个参数所在的设备
+        if not device:
+            try:
+                device = next(iter(net.parameters())).device
+            except StopIteration:
+                # 如果模型没有参数
+                device = torch.device('cpu')
+
+    # Accumulator 是我们在 d2l_utils 中定义的累加器
+    # [正确预测数, 样本总数]
+    metric = Accumulator(2)
+
+    with torch.no_grad(): # 评估时不需要计算梯度，节省显存和计算资源
+        for X, y in data_iter:
+            # 将数据搬运到与模型相同的设备
+            X, y = X.to(device), y.to(device)
+
+            # 计算正确数并累加
             metric.add(count_correct(net(X), y), y.numel())
 
     return metric[0] / metric[1]
