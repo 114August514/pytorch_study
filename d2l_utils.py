@@ -24,6 +24,7 @@ __status__ = "Development"
 
 # --- 标准库导入 ---
 import sys
+import time
 from typing import (
     Final,
     Callable,
@@ -37,7 +38,9 @@ from pathlib import Path
 # --- 第三方库导入 ---
 import torch
 import torchvision
+import numpy as np
 import matplotlib.pyplot as plt
+from IPython import display
 from torch import nn, Tensor
 from torch.utils import data
 from torch.utils.data import DataLoader
@@ -66,6 +69,8 @@ __all__ = [
     'DATA_ROOT',
     'IS_WINDOWS',
     'Accumulator',
+    'Timer',
+    'Animator',
     'get_default_device',
     'load_fashion_mnist',
     'count_correct',
@@ -86,7 +91,7 @@ __all__ = [
 # 一个用于在多个批次（Batch）间累加数据（如损失总和、正确个数）的小工具。
 class Accumulator:
     """在 n 个变量上累加数值的实用工具，自动适配设备并支持异步加速。"""
-    def __init__(self, n: int, device: Optional[torch.device]):
+    def __init__(self, n: int, device: Optional[torch.device] = None):
         """初始化 n 个变量。
         
         Args:
@@ -138,6 +143,198 @@ class Accumulator:
     def __getitem__(self, idx: int) -> float | Tensor:
         """支持通过索引访问，例如 acc[0]。"""
         return self.data[idx]
+
+# 计时器
+# 一个用于在训练过程中精确测量各个环节（如数据加载、模型计算）耗时的小工具。
+class Timer:
+    """记录多次运行时间的实用工具类。
+    
+    主要用于性能分析：通过记录每个 Epoch 或每个操作的耗时，帮助开发者识别
+    代码中的性能瓶颈（如 CPU 数据加载是否慢于 GPU 计算）。
+
+    Attributes:
+        times (list[float]): 存储每次运行持续时间的列表。
+        tik (float): 当前计时周期的开始时间戳。
+    """
+    def __init__(self):
+        """初始化计时器。"""
+        self.times: list[float] = []
+        self.tik: float = 0.0
+        self.start()
+
+    def start(self) -> None:
+        """开启/重启计时器。"""
+        self.tik = time.perf_counter()
+
+    def stop(self) -> float:
+        """停止计时器并将时间记录在列表中。
+        
+        Returns:
+            float: 最近一次计时周期的持续时间（秒）。
+        """
+        self.times.append(time.perf_counter() - self.tik)
+        return self.times[-1]
+    
+    def avg(self) -> float:
+        """计算平均运行时间。"""
+        return sum(self.times) / len(self.times)
+    
+    def sum(self) -> float:
+        """计算总运行时间。"""
+        return sum(self.times)
+    
+    def cumsum(self) -> list[float]:
+        """返回累计运行时间列表，
+        
+        如原本记录是 [10s, 10s, 11s]，返回为 [10s, 20s, 31s]。
+        """
+        return np.array(self.times).cumsum().tolist()
+
+# 动画器
+# 用以在 Jupyter Notebook 上实时绘图的工具。
+class Animator:
+    """在动画中绘制数据的实用工具类。
+    
+    支持在训练过程中动态更新 Loss、Train Acc 和 Test Acc 曲线。
+    
+    Attributes:
+        fig (plt.Figure): Matplotlib 画布对象（它是整个窗口，包括背景、边框）。
+        axes (plt.Axes): 画布中的坐标轴对象 (管理绘图区域的对象列表)。
+    """
+
+    def __init__(
+        self,
+        xlabel: Optional[str] = None,                       # X 轴标签（如 'epoch'）
+        ylabel: Optional[str] = None,                       # Y 轴标签（如 'accuracy'）
+        legend: Optional[list[str]] = None,                 # 图例名称列表
+        xlim: Optional[list[float]] = None,                 # X 轴范围 [min, max]
+        ylim: Optional[list[float]] = None,                 # Y 轴范围 [min, max]
+        xscale: str = 'linear',                             # X 轴缩放类型（'linear' 或 'log'）
+        yscale: str = 'linear',                             # Y 轴缩放类型
+        fmts: tuple[str, ...] = ('-', 'm--', 'g-.', 'r:'),  # 曲线样式：实线、洋红色虚线、绿点划线、红点线
+        nrows: int = 1,                                     # 子图行数
+        ncols: int = 1,                                     # 子图列数
+        figsize: tuple[float, float] = (7.2, 4.8)               # 画布尺寸
+    ) -> None:
+        """初始化动画器，配置画布属性。
+        
+        Args:
+            xlabel: X 轴标签（如 'epoch'）。
+            ylabel: Y 轴标签（如 'accuracy'）。
+            legend: 图例名称列表。
+            xlim: X 轴范围 [min, max]。
+            ylim: Y 轴范围 [min, max]。
+            xscale: X 轴缩放类型（'linear' 或 'log'）。
+            yscale: Y 轴缩放类型。
+            fmts: tuple[str, ...] = ('-', 'm--', 'g-.', 'r:'),  # 曲线样式：实线、洋红色虚线、绿点划线、红点线。
+            nrows: 子图行数。
+            ncols: 子图列数。
+            figsize: 画布尺寸。
+        """
+        # 1. 如果没有提供图例，初始化为空列表
+        if legend is None:
+            legend = []
+
+        # 2. 创建 Matplotlib 画布(fig)和坐标轴(axes)
+        self.fig, self.axes = plt.subplots(nrows, ncols, figsize=figsize)
+
+        # 3. 如果只有一个子图，将其放入列表中以便统一处理
+        if nrows * ncols == 1:
+            self.axes = [self.axes, ]
+        
+        # 4. 定义一个 lambda 闭包，用于快速应用坐标轴配置
+        # 这里使用了内部方法 _set_axes，创建一个待执行任务。
+        # 由于当前预设是仅一个主图，所以锁定 self.axes[0]
+        self.config_axes = lambda: self._set_axes(
+            self.axes[0], xlabel, ylabel, xlim, ylim, xscale, yscale, legend
+        )
+
+        # 5. 初始化数据存储：X 轴点集，Y 轴点集（支持多条曲线），以及样式
+        self.X, self.Y, self.fmts = None, None, fmts
+
+    def _set_axes(
+        self, 
+        ax: plt.Axes, 
+        xlabel: Optional[str],
+        ylabel: Optional[str],
+        xlim: Optional[Iterable[float]],
+        ylim: Optional[Iterable[float]],
+        xscale: str,
+        yscale: str,
+        legend: Optional[Iterable[str]]
+    ) -> None:
+        """内部辅助函数：配置 Matplotlib 坐标轴的显示属性。
+        
+        该函数采用参数驱动模式，仅在参数非空时更新坐标轴属性，
+        以避免破坏 Matplotlib 的自动缩放 (Auto-scaling) 逻辑。
+
+        Args:
+            ax: 目标 Matplotlib 坐标轴对象。
+            xlabel: X 轴标签文本。
+            ylabel: Y 轴标签文本。
+            xlim: X 轴显示范围，通常提供为 [min, max]。
+            ylim: Y 轴显示范围。
+            xscale: X 轴缩放模式，例如 'linear' 或 'log'。
+            yscale: Y 轴缩放模式。
+            legend: 图例名称列表，按绘制顺序匹配。
+        """
+        # 1. 基础标签与缩放配置
+        ax.set_xlabel(xlabel) if xlabel else None
+        ax.set_ylabel(ylabel) if ylabel else None
+        ax.set_xscale(xscale)
+        ax.set_yscale(yscale)
+
+        # 2. 轴范围配置（仅在明确指定时覆盖 Matplotlib 默认值）
+        if xlim:
+            ax.set_xlim(xlim)
+        if ylim:
+            ax.set_ylim(ylim)
+
+        # 3. 辅助组件配置
+        if legend:
+            # bbox_to_anchor=(1.05, 1): 将图例放在坐标轴右侧 (1.05) 的顶部 (1)
+            # loc='upper left': 图例自身的左上角对齐到这个位置
+            ax.legend(legend, loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        # 使用更美观的半透明虚线网格
+        ax.grid(True, linestyle='--', alpha=0.6) 
+
+    def add(self, x: Union[int, float], y: Union[float, Iterable[float]]) -> None:
+        """向图表中添加多个数据点并实时重绘。
+        
+        Args:
+            x: 当前横坐标（通常为 epoch）。
+            y: 当前纵坐标数值或数值列表（对应不同的曲线）。
+        """
+        # 1. 预处理输入：如果 y 只是一个数（单条曲线），转成列表形式
+        if not hasattr(y, "__iter__"):
+            y = [y]
+        n = len(y) # 获取当前数据包含多少个指标（曲线数）
+
+        # 2. 缓加载初始化：根据第一次 add 时 y 的长度来创建存储空间
+        if self.X is None:
+            self.X = [[] for _ in range(n)] # 为每条曲线准备 X 坐标列表
+        if self.Y is None:
+            self.Y = [[] for _ in range(n)] # 为每条曲线准备 Y 坐标列表
+        
+        # 3. 将新的点存入历史列表中
+        for i, val in enumerate(y):
+            if val is not None:
+                self.X[i].append(x)
+                self.Y[i].append(val)
+
+        # 4. 绘图核心逻辑：
+        self.axes[0].cla() # 清除坐标轴上的旧内容
+        
+        # 遍历每条曲线，绘制已记录的所有历史点
+        for x_list, y_list, fmt in zip(self.X, self.Y, self.fmts):
+            self.axes[0].plot(x_list, y_list, fmt)
+        
+        # 重新应用坐标轴配置（因为 cla() 会重置这些配置）
+        self.config_axes()
+
+        # 5. 在 Notebook 中执行实时渲染
+        display.display(self.fig)           # 每次绘制后，立即在输出区显示当前的图像
+        display.clear_output(wait=True)     # 清除当前单元格的输出。wait=True 非常重要：它会等到下一张图画好才清除旧图，避免闪烁。
 
 def get_dataloader_workers() -> int:
     """根据系统常量返回推荐的进程数。"""
