@@ -69,6 +69,7 @@ __all__ = [
     'get_default_device',
     'load_fashion_mnist',
     'count_correct',
+    'count_correct_tensor',
     'evaluate_accuracy',
     'evaluate_accuracy_gpu',
     'cross_entropy',
@@ -84,28 +85,57 @@ __all__ = [
 # 累加器
 # 一个用于在多个批次（Batch）间累加数据（如损失总和、正确个数）的小工具。
 class Accumulator:
-    """在 n 个变量上累加数值的实用工具。"""
-    def __init__(self, n: int):
-        """初始化 n 个变量，初始值均为 0.0。
+    """在 n 个变量上累加数值的实用工具，自动适配设备并支持异步加速。"""
+    def __init__(self, n: int, device: Optional[torch.device]):
+        """初始化 n 个变量。
         
         Args:
             n: 需要累加的变量个数。
         """
-        self.data: list[float] = [0.0] * n
+        self.n: int = n
+        self.device: Optional[torch.device] = device
+        
+        # 如果初始化时指定了设备，直接创建 Tensor，省去后续推断
+        if device:
+            self.data = [torch.tensor(0.0, device=device) for _ in range(n)]
+            self._is_moved: bool = True
+        else:
+            self.data = [0.0] * n
+            self._is_moved: bool = False
 
-    def add(self, *args: float) -> None:
-        """将传入的多个数值分别累加到相应的位置。
+    def add(self, *args: float | Tensor) -> None:
+        """将传入的多个数值或张量分别累加。
         
         Args:
-            *args: 与初始化时 n 长度一致的数值序列。
+            *args: 与初始化时 n 长度一致的数值或张量序列。
         """
-        self.data = [a + float(b) for a, b in zip(self.data, args)]
+        # 1. 探测逻辑：仅在第一次调用且尚未确立设备时执行
+        if not self._is_moved:
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    # 将所有的 0.0 初始化为对应设备的 Tensor
+                    # 这样后续的 a + b 就是 GPU 上的原生加法
+                    self.device = arg.device
+                    self.data = [torch.tensor(0.0, device=self.device) for _ in range(self.n)]
+                    break
+            
+            # “探测”逻辑在整个生命周期中只运行一次
+            self._is_moved = True
+
+        # 2. 异步累加 (始终保持在原有设备上，不触发同步)
+        self.data = [a + b for a, b in zip(self.data, args)]
 
     def reset(self) -> None:
-        """重置所有累加值为 0。"""
-        self.data = [0.0] * len(self.data)
+        """重置累加器，但保持设备锁定状态。"""
+        if self.device:
+            # 如果已经确定了设备，重置时依然留在该设备
+            self.data = [torch.tensor(0.0, device=self.device) for _ in range(self.n)]
+        else:
+            # 如果从来没见过 Tensor，恢复到纯 float 状态
+            self.data = [0.0] * self.n
+            self._is_moved = False
 
-    def __getitem__(self, idx: int) -> float:
+    def __getitem__(self, idx: int) -> float | Tensor:
         """支持通过索引访问，例如 acc[0]。"""
         return self.data[idx]
 
@@ -252,6 +282,22 @@ def count_correct(y_hat: Tensor, y: Tensor) -> int:
     cmp = y_hat.type(y.dtype) == y
     return int(cmp.type(y.dtype).sum().item())
 
+def count_correct_tensor(y_hat: Tensor, y: Tensor) -> Tensor:
+    """【高性能版】计算预测正确的数量，返回 Tensor (不触发 CPU 同步)。
+    
+    Args:
+        y_hat: 预测概率分布。
+        y: 真实标签。
+
+    Returns:
+        Tensor: 这一批次中预测正确的样本总数。
+    """
+    if len(y_hat.shape) > 1 and y_hat.shape[1] > 1:
+        y_hat = y_hat.argmax(axis=1)
+    
+    cmp = y_hat.type(y.dtype) == y
+    return cmp.type(y.dtype).sum()
+
 def cross_entropy(y_hat: Tensor, y: Tensor) -> Tensor:
     """计算交叉熵损失。
     
@@ -320,6 +366,10 @@ def evaluate_accuracy(net: Callable[[Tensor], Tensor], data_iter: DataLoader) ->
 def evaluate_accuracy_gpu(net: Callable[[Tensor], Tensor], data_iter: data.DataLoader, device: torch.device = None) -> float:
     """使用 GPU 计算在指定数据集上模型的准确率。
     
+    优化说明：
+    1. 采用高性能 Accumulator 初始化，减少设备探测。
+    2. 使用 count_correct_tensor 替代 count_correct，消除循环内的 CPU-GPU 同步。
+
     Args:
         net: 神经网络模型。
         data_iter: 验证集或测试集的迭代器。
@@ -340,7 +390,7 @@ def evaluate_accuracy_gpu(net: Callable[[Tensor], Tensor], data_iter: data.DataL
 
     # Accumulator 是我们在 d2l_utils 中定义的累加器
     # [正确预测数, 样本总数]
-    metric = Accumulator(2)
+    metric = Accumulator(2, device)
 
     with torch.no_grad(): # 评估时不需要计算梯度，节省显存和计算资源
         for X, y in data_iter:
@@ -348,9 +398,12 @@ def evaluate_accuracy_gpu(net: Callable[[Tensor], Tensor], data_iter: data.DataL
             X, y = X.to(device), y.to(device)
 
             # 计算正确数并累加
-            metric.add(count_correct(net(X), y), y.numel())
+            # int 会自动转换为 Tensor，且效率更高
+            metric.add(count_correct_tensor(net(X), y), y.numel())
 
-    return metric[0] / metric[1]
+    # 在最后返回时，由 .item() 触发唯一一次 CPU-GPU 同步
+    # 这会将最终结果（预测正确总数 / 样本总数）从 GPU 取回 CPU 并转为 float
+    return (metric[0] / metric[1]).item()
 
 # 单轮训练函数
 def train_softmax_epoch(
