@@ -411,7 +411,7 @@ def load_fashion_mnist(
         batch_size: int = DEFAULT_BATCH_SIZE,
         resize: Optional[int] = None,
         num_workers: int = get_dataloader_workers()
-) -> tuple[data.dataloader, data.dataloader]:
+) -> tuple[data.DataLoader, data.DataLoader]:
     """整合下载、预处理与加载逻辑，返回最终的 DataLoader。
 
     这是供模型训练脚本调用的主入口函数。
