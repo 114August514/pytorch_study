@@ -13,6 +13,7 @@ dependencies = [
     "matplotlib",
     "d2l",
     "numpy>=1.26.0", # 强制要求支持 Python 3.12 的 Numpy 版本
+    "rich>=15.0.0",
 ]
 
 [tool.uv]
