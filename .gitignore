@@ -6,9 +6,14 @@ build/
 dist/
 wheels/
 *.egg-info
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
 
 # Virtual environments
 .venv
 
 # temp files
 temp/
+.codex
